@@ -20,8 +20,8 @@ SEED = 391
 torch.manual_seed(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -30,13 +30,17 @@ def report_gpu():
     torch.cuda.empty_cache()
     gc.collect()
 
+def adjust_labels(example):
+    example["labels"] = int(example["labels"]) - 1  # Adjust if labels are 1-indexed
+    return example
 
 def tokenize_dataset(dataset, tokenizer):
     dataset = dataset.map(
-        lambda x: tokenizer(x["text"], max_length=128, padding='max_length', truncation=True),
+        lambda x: tokenizer(x["text"], max_length=256, padding='max_length', truncation=True),
         batched=True
     )
     dataset = dataset.rename_column('label', 'labels')  # Ensure 'label' column is correctly named
+    dataset = dataset.map(adjust_labels)
     dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
     return dataset
 
@@ -47,7 +51,7 @@ def train(model, train_loader, eval_loader, run, optim, scheduler, config):
 
     batch_count = 0
     rounds_count = 0
-    max_acc = 0
+    best_mae = float('inf')  # Lower MAE is better
 
     for epoch in range(config['num_epochs']):
         model.train()
@@ -76,6 +80,8 @@ def train(model, train_loader, eval_loader, run, optim, scheduler, config):
                 model.eval()
                 eval_loss = 0
                 correct_preds = 0
+                total_samples = 0
+                total_abs_error = 0  # For MAE
 
                 with torch.no_grad():
                     loop = tqdm(eval_loader, leave=True)
@@ -86,26 +92,35 @@ def train(model, train_loader, eval_loader, run, optim, scheduler, config):
                         labels = eval_batch['labels'].to(device)
 
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                        eval_loss += outputs.loss
+                        eval_loss += outputs.loss.item()
 
                         preds = torch.argmax(outputs.logits, dim=-1)
                         correct_preds += (preds == labels).sum().item()
 
+                        abs_error = torch.abs(preds - labels)
+                        total_abs_error += abs_error.sum().item()
+
+                        total_samples += labels.size(0)
                         # report_gpu()
 
-                    accuracy = correct_preds / len(eval_loader.dataset)
+                    avg_eval_loss = eval_loss / len(eval_loader)
+                    accuracy = correct_preds / total_samples
+                    mae = total_abs_error / total_samples
 
-                    print("Eval loss: " + str(round(eval_loss / len(eval_loader), 3)))
+                    print("Eval loss: {:.3f}".format(avg_eval_loss))
+                    print("Eval accuracy: {:.3f}".format(accuracy))
+                    print("Eval MAE: {:.3f}".format(mae))
 
-                    run.log({"eval/loss": eval_loss / len(eval_loader)})
+                    run.log({"eval/loss": avg_eval_loss})
                     run.log({"eval/accuracy": accuracy})
+                    run.log({"eval/MAE": mae})
 
-                    if accuracy > max_acc:
-                        max_acc = accuracy
+                    if mae < best_mae:
+                        best_mae = mae
                         rounds_count = 0
                         try:
                             if batch_count > 0:
-                                model.save_pretrained(f"trained_models/model_{run.get_run_url().split('/')[-1][4:]}_{epoch}_{batch_count}", from_pt=True)
+                                model.save_pretrained(f"trained_models/model_{run.get_url().split('/')[-1][4:]}_{epoch}_{batch_count}", from_pt=True)
                         except Exception as e:
                             print(f"Model not saved at epoch {epoch}, batch {batch_count}: {e}")
 
@@ -121,33 +136,42 @@ def train(model, train_loader, eval_loader, run, optim, scheduler, config):
             loop.set_description(f'Epoch {epoch}')
 
         try:
-            model.save_pretrained(f"trained_models/model_{run.get_run_url().split('/')[-1][4:]}_{epoch}", from_pt=True)
+            model.save_pretrained(f"trained_models/model_{run.get_url().split('/')[-1][4:]}_{epoch}", from_pt=True)
         except Exception as e:
             print(f'model not saved epoch = {epoch}, batch = {batch_count}: {e}')
         batch_count = 0
 
+def verify_labels(dataset):
+    unique_labels = set(dataset['train']['labels'].tolist())
+
+    print(f"Unique labels in train: {unique_labels}")
+
 
 if __name__ == "__main__":
-    config = {"batch_size": 128,
+    config = {"batch_size": 64,
               # "scale": 20.0,
               "learning_rate": 2e-6,
               "num_epochs": 10,
               "early_stopping": 50,
               # "reinit_n_layers": 3,
-              "NUM_ACCUMULATION_STEPS": 8}
+              "NUM_ACCUMULATION_STEPS": 8,
+              "model": "youscan/ukr-roberta-base"} # 'xlm-roberta-base'
 
     run = wandb.init(project="review-sbert",
                      config=config)
 
-    dataset = load_dataset('csv', data_files={'train': "train_reviews.csv",
-                                              'eval': "eval_reviews.csv",
-                                              'test': "test_reviews.csv"})
+    dataset = load_dataset('csv', data_files={'train': "cross_domain_uk_reviews/train_reviews.csv",
+                                              'eval': "cross_domain_uk_reviews/eval_reviews.csv",
+                                              'test': "cross_domain_uk_reviews/test_reviews.csv"})
 
-    tokenizer = AutoTokenizer.from_pretrained('xlm-roberta-base')
+    tokenizer = AutoTokenizer.from_pretrained(config['model'])
 
     dataset = tokenize_dataset(dataset, tokenizer)
 
-    model = AutoModelForSequenceClassification.from_pretrained('xlm-roberta-base', num_labels=5)
+    model = AutoModelForSequenceClassification.from_pretrained(config['model'], num_labels=5)
+    # model = AutoModelForMaskedLM.from_pretrained("youscan/ukr-roberta-base")   
+
+    model.config.problem_type = "single_label_classification"
 
     # model = nn.DataParallel(model)
     model.to(device)

@@ -1,3 +1,6 @@
 .idea/
 .ipynb_checkpoints/
 *.csv
+roberta_finetune/
+trained_models/
+wandb/

@@ -2,3 +2,4 @@ wandb
 transformers
 numpy
 torch
+datasets
