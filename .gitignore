@@ -4,3 +4,5 @@
 roberta_finetune/
 trained_models/
 wandb/
+cross_domain_uk_reviews/
+unlp_sharedtask_dataset/
